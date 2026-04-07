@@ -1,0 +1,20 @@
+{
+  "name": "subagents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "subagents": "./bin/subagents"
+  },
+  "scripts": {
+    "dev": "bun run ./src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build ./src/cli.ts --outfile ./dist/subagents --target bun",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.11",
+    "typescript": "^5.8.3"
+  }
+}
+
