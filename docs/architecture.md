@@ -4,12 +4,13 @@
 
 `subagents` is a standalone CLI, not an embedded in-process tool. Other harnesses call the `subagents` binary as a machine interface.
 
-The design direction is:
+The current design direction is:
 - Bun TypeScript runtime
-- file-backed task store
-- background worker subprocess per active task
+- file-backed JSON and JSONL state
+- one background worker process per active task
+- a global active-task pool with immediate-start semantics
 - OpenRouter completions as the only provider in v1
-- owner-scoped isolation keyed by harness session identity
+- owner-scoped namespacing keyed by harness session identity
 
 ## Primary Decisions
 
@@ -23,9 +24,9 @@ That means:
 - task state is durable on disk
 - callers poll or await via follow-up CLI invocations
 
-### 2. Owner-scoped visibility
+### 2. Owner namespacing, not security isolation
 
-Every task belongs to one owner:
+Every task belongs to one owner namespace:
 
 ```text
 owner = {
@@ -36,52 +37,82 @@ owner = {
 
 The runtime derives an internal `owner_key = hash(harness + ":" + session_id)`.
 
-All lookup APIs are filtered by `owner_key`. Cross-owner requests must fail as if the task does not exist.
+This key is used so multiple concurrent supervisors can keep their task sets separate. It is not meant to be a strong security boundary.
 
-### 3. Frozen execution context at spawn
+### 3. Immediate-start pool, no public queue
+
+The runtime uses a pool of active worker processes.
+
+Public semantics:
+- `spawn` tries to start a worker immediately
+- if a task slot is available, the task enters `starting` and then `running`
+- if the pool is full, `spawn` fails with a pool-cap error
+- the public contract does not pretend there is a durable queue until we build a real scheduler
+
+### 4. Frozen execution context at spawn
 
 Spawn-time values are snapshotted into task metadata:
 - `cwd`
 - labels
 - context
-- inference settings
-- constraints
-- tool policy
+- limits
+- execution settings
+- tool preset and allow/deny lists
+- completion requirements
 
 The caller can change later, but the running task does not inherit those changes.
 
-### 4. No recursive subagents
+### 5. Internal protocol tools over text markers
 
-The standalone runtime owns its own tools and worker loop. Subagents do not get access to a `subagents` tool.
+The worker runtime should prefer explicit internal machine actions instead of parsing assistant prose markers.
 
-### 5. One provider only
+Planned internal protocol tools:
+- `task_progress`
+- `task_request_input`
+- `task_complete`
+
+This keeps progress reporting, input pauses, and final completion structured and testable.
+
+### 6. One provider only
 
 V1 only targets OpenRouter completions. The codebase should reflect that directly:
 - one provider adapter
 - one request/response model
 - no abstract multi-provider layer beyond what we clearly need
 
+### 7. Tool presets are convenience bundles, not sandboxing
+
+The runtime should support tool presets such as:
+- `all`
+- `read_only`
+- `workspace_write`
+- `custom`
+
+These presets are about spawn-time configuration, not safety boundaries.
+
 ## Planned Repo Layout
 
 ```text
 bin/
-  subagents              Bun launcher
+  subagents                  Bun launcher
 docs/
   architecture.md
   command-contract.md
+  v1-milestone.md
 src/
-  cli.ts                 CLI entrypoint
-  commands.ts            command registry and stub handlers
-  contracts.ts           request/response and domain types
-  errors.ts              stable CLI/runtime errors
-  json.ts                JSON input/output helpers
-  meta.ts                app metadata and contract version
-  usage.ts               help text
+  cli.ts                     CLI entrypoint
+  commands.ts                command registry and validation
+  contracts.ts               request/response and domain types
+  errors.ts                  stable CLI/runtime errors
+  json.ts                    JSON input/output helpers
+  meta.ts                    app metadata and contract version
+  usage.ts                   help text
   runtime/
-    openrouter.ts        OpenRouter-only provider surface
-    worker.ts            worker process contracts
+    openrouter.ts            OpenRouter-only provider surface
+    protocol-tools.ts        internal progress/input/completion tool shapes
+    worker.ts                worker process contracts
   store/
-    layout.ts            owner/task path helpers
+    layout.ts                owner/task path helpers
 ```
 
 ## Planned Storage Layout
@@ -97,42 +128,64 @@ src/
           state.json
           events.jsonl
           inbox.jsonl
-          worker.pid
           lock
           runs/
             <run-id>/
               transcript.jsonl
               tool-outputs/
               artifacts/
+  runtime/
+    active/
+      <task-id>.json
 ```
+
+Design intent:
+- `task.json` holds immutable spawn-time inputs
+- `state.json` holds the latest mutable state snapshot
+- `events.jsonl` is append-only
+- `inbox.jsonl` records owner-to-worker messages
+- `runtime/active/<task-id>.json` acts as the pool lease and heartbeat record
 
 ## Worker Model
 
 Planned control flow:
 
-1. `subagents spawn` writes task metadata.
-2. The CLI starts `subagents internal-worker --task-id <id> --owner-key <key>`.
-3. The worker claims the task lock, updates state, and runs the agent loop.
-4. The worker appends events and heartbeats to disk.
-5. `recv`, `await`, `inspect`, and `list` read that durable state.
+1. `subagents spawn` validates input and writes task metadata.
+2. The CLI attempts to acquire an active pool slot.
+3. If the pool is full, `spawn` fails immediately.
+4. If a slot is available, the CLI starts `subagents internal-worker --task-id <id> --owner-key <key>`.
+5. The worker claims the task lock, updates state, and runs the agent loop.
+6. The worker appends events, writes heartbeats, and reads `inbox.jsonl` for owner messages.
+7. On terminal completion, the worker writes final state, releases the pool lease, and exits.
 
 This keeps the user-facing command surface stable while allowing workers to outlive the launching process.
+
+## Event And Cursor Model
+
+The external control plane is event-driven:
+- each task has an append-only event log
+- `spawn` returns the first cursor
+- `recv` polls multiple tasks at once and returns events grouped by task
+- `await` blocks on one task until a condition is met
+
+The worker owns event emission. Supervisors only consume events and send messages.
 
 ## Command Discipline
 
 - stdout: exactly one JSON object for machine commands
 - stderr: human diagnostics only
-- no streaming in v1
 - no shell-oriented text output for task commands
+
+The stable contract is machine-readable JSON. If we later support streaming, it should be additive and not break the existing request/response interface.
 
 ## What This Skeleton Intentionally Does Not Do Yet
 
 - store real tasks
-- talk to OpenRouter
 - spawn workers
+- enforce the active pool
 - implement event cursors
-- perform tool execution
-- compact or summarize history
+- talk to OpenRouter
+- execute tools
+- parse protocol-tool calls
 
-This repo state is meant to lock the external contract before runtime work starts.
-
+This repo state is meant to lock the external contract and runtime direction before deeper implementation work starts.

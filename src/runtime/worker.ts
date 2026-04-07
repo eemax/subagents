@@ -1,9 +1,20 @@
-import type { OwnerRef, TaskInput, TaskState, TurnOwner } from "../contracts";
+import type {
+  EventKind,
+  OwnerRef,
+  ProgressInfo,
+  TaskError,
+  TaskInput,
+  TaskResult,
+  TaskState,
+  TurnOwner
+} from "../contracts";
+import type { ProtocolToolName } from "./protocol-tools";
 
 export interface WorkerLaunchSpec {
   task_id: string;
   owner: OwnerRef;
   task: TaskInput;
+  protocol_tools?: ProtocolToolName[];
 }
 
 export interface WorkerStateSnapshot {
@@ -11,15 +22,20 @@ export interface WorkerStateSnapshot {
   state: TaskState;
   turn_owner: TurnOwner;
   updated_at: string;
+  last_heartbeat_at?: string | null;
 }
 
 export interface WorkerEvent {
   event_id: string;
   task_id: string;
+  seq: number;
   ts: string;
-  kind: string;
+  kind: EventKind;
   state: TaskState;
   turn_owner: TurnOwner;
-  message?: string;
+  message: string;
+  final: boolean;
+  progress?: ProgressInfo;
+  result?: TaskResult;
+  error?: TaskError;
 }
-

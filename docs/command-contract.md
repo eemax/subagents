@@ -1,14 +1,15 @@
 # Command Contract
 
-This document defines the first-pass external contract for the `subagents` CLI.
+This document defines the first durable external contract for the `subagents` CLI.
 
 ## Scope
 
-V1 constraints:
+V1 contract constraints:
 - non-interactive CLI only
 - one provider only: OpenRouter completions
-- one owner namespace per harness session
-- all task commands are owner-scoped
+- owner-scoped task visibility keyed by harness session identity
+- one background worker process per running task
+- no scheduler queue in the public model
 - all machine commands return one JSON object on stdout
 
 ## Command Set
@@ -24,6 +25,8 @@ V1 constraints:
 - `subagents list`
 - `subagents cancel`
 - `subagents run`
+
+The runtime may also expose private internal commands such as `internal-worker`, but those are not part of the public harness contract.
 
 ## Global Flags
 
@@ -79,7 +82,7 @@ Failure:
 
 ## Owner Model
 
-Owner identity is logical, not OS-level, in v1:
+Owner identity is a visibility namespace, not an OS or security boundary:
 
 ```json
 {
@@ -92,9 +95,9 @@ Owner identity is logical, not OS-level, in v1:
 
 Rules:
 - all task-bearing commands require `owner`
-- task lookup is filtered by owner
-- cross-owner access returns `TASK_NOT_FOUND`
-- runtime storage will derive an internal `owner_key` from `harness + ":" + session_id`
+- the runtime derives an internal `owner_key` from `harness + ":" + session_id`
+- `list`, `inspect`, `recv`, `await`, `send`, and `cancel` only operate on tasks in that owner namespace
+- this is meant to keep concurrent supervisors from stepping on each other, not to provide strong security isolation
 
 ## Shared Domain Types
 
@@ -107,7 +110,7 @@ Owner:
 }
 ```
 
-Artifact:
+Attachment:
 
 ```json
 {
@@ -117,7 +120,18 @@ Artifact:
 }
 ```
 
+Progress:
+
+```json
+{
+  "percent": 40,
+  "milestone": "finished repo scan"
+}
+```
+
 ## `spawn`
+
+`spawn` is idempotent per `owner + idempotency_key`.
 
 Request:
 
@@ -129,6 +143,7 @@ Request:
     "harness": "codex",
     "session_id": "sess_123"
   },
+  "idempotency_key": "repo_inspect_001",
   "task": {
     "title": "Repo inspection",
     "goal": "Inspect the repo and summarize the architecture.",
@@ -142,17 +157,17 @@ Request:
       "kind": "analysis"
     },
     "artifacts": [],
-    "constraints": {
+    "limits": {
       "max_turns": 20,
       "max_wall_time_sec": 900,
       "max_total_tokens": 50000
     },
-    "inference": {
+    "execution": {
       "model": "openai/gpt-4.1-mini",
       "temperature": 0
     },
-    "tool_policy": {
-      "mode": "default"
+    "tools": {
+      "preset": "read_only"
     },
     "completion": {
       "require_structured_result": true,
@@ -161,6 +176,11 @@ Request:
   }
 }
 ```
+
+Behavior:
+- `spawn` tries to start a worker immediately
+- if the runtime pool is full, `spawn` fails with a pool-cap style error
+- `spawn` does not enqueue work in the public contract
 
 Response:
 
@@ -203,14 +223,21 @@ Response:
   "contract": "subagents.v1alpha1",
   "ok": true,
   "data": {
-    "events": [],
-    "cursors": {
-      "task_01": "evt_05",
-      "task_02": "evt_09"
+    "tasks": {
+      "task_01": {
+        "events": [],
+        "cursor": "evt_05"
+      },
+      "task_02": {
+        "events": [],
+        "cursor": "evt_09"
+      }
     }
   }
 }
 ```
+
+`recv` is grouped by task, not returned as one merged flat stream.
 
 ## `await`
 
@@ -223,7 +250,7 @@ Request:
     "session_id": "sess_123"
   },
   "task_id": "task_01",
-  "until": ["terminal", "requires_input"],
+  "until": ["terminal", "needs_input"],
   "timeout_ms": 30000,
   "cursor": "evt_05"
 }
@@ -231,9 +258,23 @@ Request:
 
 Valid `until` values:
 - `terminal`
-- `requires_input`
+- `needs_input`
 - `progress`
 - `any_event`
+
+Representative response:
+
+```json
+{
+  "contract": "subagents.v1alpha1",
+  "ok": true,
+  "data": {
+    "task_id": "task_01",
+    "events": [],
+    "cursor": "evt_08"
+  }
+}
+```
 
 ## `send`
 
@@ -253,6 +294,13 @@ Request:
 }
 ```
 
+Valid message kinds:
+- `guidance`
+- `correction`
+- `override`
+- `approval`
+- `answer`
+
 ## `inspect`
 
 Request:
@@ -267,13 +315,22 @@ Request:
 }
 ```
 
-Response shape will include:
-- task metadata
-- current state
-- turn owner
-- latest result or error
-- latest progress
-- available tools
+Representative response fields:
+- `task_id`
+- `owner`
+- `title`
+- `state`
+- `turn_owner`
+- `created_at`
+- `started_at`
+- `updated_at`
+- `last_event_id`
+- `last_heartbeat_at`
+- `progress`
+- `result`
+- `error`
+- `labels`
+- `available_tools`
 
 ## `list`
 
@@ -290,6 +347,18 @@ Request:
     "labels": {
       "kind": "analysis"
     }
+  }
+}
+```
+
+Representative response:
+
+```json
+{
+  "contract": "subagents.v1alpha1",
+  "ok": true,
+  "data": {
+    "tasks": []
   }
 }
 ```
@@ -325,10 +394,11 @@ Request:
 }
 ```
 
+`run` uses the same `idempotency_key` semantics as `spawn`.
+
 ## Task State Model
 
 Planned states:
-- `queued`
 - `starting`
 - `running`
 - `needs_input`
@@ -343,6 +413,81 @@ Planned turn-owner values:
 - `owner`
 - `none`
 
+## Tool Presets
+
+The public contract supports convenience presets for the initial tool set:
+- `all`
+- `read_only`
+- `workspace_write`
+- `custom`
+
+These are configuration presets, not sandbox boundaries.
+
+## Result Schema
+
+Completed tasks should normalize to a structured result payload inspired by `agent-commander`:
+
+```json
+{
+  "summary": "Short final summary",
+  "outcome": "success",
+  "confidence": 0.84,
+  "confirmed": [],
+  "inferred": [],
+  "unverified": [],
+  "deliverables": [],
+  "evidence": [],
+  "open_issues": [],
+  "recommended_next_steps": [],
+  "raw_final_message": "Optional raw assistant text"
+}
+```
+
+## Event Schema
+
+Each task event carries a stable core shape:
+
+```json
+{
+  "event_id": "evt_01",
+  "task_id": "task_01",
+  "seq": 1,
+  "ts": "2026-04-07T00:00:00.000Z",
+  "state": "running",
+  "kind": "progress",
+  "turn_owner": "subagent",
+  "message": "Finished repo scan",
+  "final": false
+}
+```
+
+Supported `kind` values:
+- `started`
+- `heartbeat`
+- `progress`
+- `question`
+- `artifact`
+- `result`
+- `error`
+- `status_change`
+- `warning`
+
+Optional fields:
+- `progress`
+- `attachments`
+- `result`
+- `error`
+- `deadline_at`
+
+## Internal Protocol Tools
+
+The worker runtime should prefer explicit internal protocol tools over parsing assistant prose markers:
+- `task_progress`
+- `task_request_input`
+- `task_complete`
+
+These are internal runtime tools, not public CLI commands.
+
 ## Error Codes
 
 Stable first-pass codes:
@@ -352,6 +497,7 @@ Stable first-pass codes:
 - `UNSUPPORTED_CONTRACT`
 - `TASK_NOT_FOUND`
 - `TASK_CONFLICT`
+- `POOL_FULL`
 - `TIMEOUT`
 - `NOT_IMPLEMENTED`
 - `INTERNAL`
@@ -361,9 +507,8 @@ Stable first-pass codes:
 - `0`: success
 - `2`: usage error
 - `3`: request validation error
-- `4`: not found or isolation rejection
+- `4`: not found
 - `5`: conflict
 - `6`: timeout
 - `7`: not implemented
 - `10`: internal error
-

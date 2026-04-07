@@ -1,6 +1,6 @@
 # subagents
 
-`subagents` is a standalone, non-interactive CLI for spawning and managing owner-scoped background subagents.
+`subagents` is a standalone, non-interactive CLI for spawning and managing owner-namespaced background subagents.
 
 This repo is intentionally in skeleton mode:
 - command and JSON contracts are defined
@@ -18,10 +18,13 @@ Implemented now:
 
 Planned next:
 - durable owner/task store
+- idempotent `spawn`
+- immediate-start worker pool
 - worker subprocess lifecycle
-- event cursors and blocking await
+- grouped `recv` and blocking `await`
 - OpenRouter-backed agent loop
-- pinned `cwd`, heartbeats, and owner isolation
+- pinned `cwd`, heartbeats, and owner namespacing
+- internal protocol tools for progress, input requests, and completion
 
 ## Quick Start
 
@@ -38,10 +41,12 @@ Example contract validation:
 echo '{
   "contract": "subagents.v1alpha1",
   "owner": { "harness": "codex", "session_id": "sess_123" },
+  "idempotency_key": "inspect_repo_001",
   "task": {
     "title": "Inspect repo",
     "goal": "Summarize the repository structure.",
-    "cwd": "/tmp/project"
+    "cwd": "/tmp/project",
+    "tools": { "preset": "read_only" }
   }
 }' | bun run src/cli.ts spawn --pretty
 ```
@@ -53,8 +58,9 @@ That currently exits with `NOT_IMPLEMENTED`, but the request shape is the one we
 - Non-interactive only
 - JSON on stdout for machine commands
 - stderr reserved for human diagnostics
-- owner-scoped task visibility
-- no recursive subagent spawning
+- owner-scoped task visibility and namespacing
+- immediate-start worker pool with no public queue
+- tool presets are convenience bundles, not sandboxing
 - one provider in v1: OpenRouter completions
 
 ## Docs

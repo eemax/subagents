@@ -1,10 +1,12 @@
 import type {
+  Attachment,
   AwaitRequest,
   CancelRequest,
   CommandName,
+  CompletionPolicy,
+  DirectiveKind,
   InspectRequest,
   JsonObject,
-  JsonValue,
   ListRequest,
   OwnerRef,
   RecvRequest,
@@ -12,13 +14,25 @@ import type {
   RunRequest,
   SendRequest,
   SpawnRequest,
-  SuccessEnvelope
+  SuccessEnvelope,
+  TaskExecution,
+  TaskInput,
+  TaskLimits,
+  TaskState,
+  TaskTools,
+  ToolPreset
 } from "./contracts";
-import { CONTRACT_SUMMARY } from "./contracts";
+import {
+  AWAIT_CONDITIONS,
+  CONTRACT_SUMMARY,
+  DIRECTIVE_KINDS,
+  TASK_STATES,
+  TOOL_PRESETS
+} from "./contracts";
 import { CliError } from "./errors";
 import { APP_NAME, APP_VERSION, CONTRACT_VERSION, PROVIDER_KIND } from "./meta";
 
-function ok<T extends JsonValue>(data: T, requestId?: string): SuccessEnvelope<T> {
+function ok<T>(data: T, requestId?: string): SuccessEnvelope<T> {
   return {
     contract: CONTRACT_VERSION,
     ok: true,
@@ -73,12 +87,38 @@ function assertNumber(value: unknown, label: string, requestId?: string): number
   return value;
 }
 
+function assertPositiveNumber(value: unknown, label: string, requestId?: string): number {
+  const parsed = assertNumber(value, label, requestId);
+  if (parsed <= 0) {
+    throw new CliError({
+      code: "INVALID_REQUEST",
+      exitCode: 3,
+      message: `${label} must be greater than zero`,
+      requestId
+    });
+  }
+  return parsed;
+}
+
+function assertBoolean(value: unknown, label: string, requestId?: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new CliError({
+      code: "INVALID_REQUEST",
+      exitCode: 3,
+      message: `${label} must be a boolean`,
+      requestId
+    });
+  }
+
+  return value;
+}
+
 function assertStringArray(value: unknown, label: string, requestId?: string): string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0)) {
     throw new CliError({
       code: "INVALID_REQUEST",
       exitCode: 3,
-      message: `${label} must be an array of strings`,
+      message: `${label} must be an array of non-empty strings`,
       requestId
     });
   }
@@ -101,12 +141,64 @@ function assertRecordOfStrings(value: unknown, label: string, requestId?: string
   return record as Record<string, string>;
 }
 
+function assertEnumValue<T extends readonly string[]>(
+  value: unknown,
+  allowed: T,
+  label: string,
+  requestId?: string
+): T[number] {
+  const parsed = assertString(value, label, requestId);
+  if (!allowed.includes(parsed)) {
+    throw new CliError({
+      code: "INVALID_REQUEST",
+      exitCode: 3,
+      message: `${label} must be one of: ${allowed.join(", ")}`,
+      requestId
+    });
+  }
+  return parsed as T[number];
+}
+
+function assertEnumArray<T extends readonly string[]>(
+  value: unknown,
+  allowed: T,
+  label: string,
+  requestId?: string
+): T[number][] {
+  const parsed = assertStringArray(value, label, requestId);
+  return parsed.map((item, index) =>
+    assertEnumValue(item, allowed, `${label}[${index}]`, requestId)
+  );
+}
+
 function assertOwner(value: unknown, requestId?: string): OwnerRef {
   const owner = assertObject(value, "owner", requestId);
   return {
     harness: assertString(owner.harness, "owner.harness", requestId),
     session_id: assertString(owner.session_id, "owner.session_id", requestId)
   };
+}
+
+function assertAttachments(value: unknown, label: string, requestId?: string): Attachment[] {
+  if (!Array.isArray(value)) {
+    throw new CliError({
+      code: "INVALID_REQUEST",
+      exitCode: 3,
+      message: `${label} must be an array`,
+      requestId
+    });
+  }
+
+  return value.map((item, index) => {
+    const attachment = assertObject(item, `${label}[${index}]`, requestId);
+    return {
+      type: assertString(attachment.type, `${label}[${index}].type`, requestId),
+      ref: assertString(attachment.ref, `${label}[${index}].ref`, requestId),
+      ...(attachment.label !== undefined
+        ? { label: assertString(attachment.label, `${label}[${index}].label`, requestId) }
+        : {})
+    };
+  });
 }
 
 function validateEnvelopeBase(input: JsonObject): { requestId?: string } {
@@ -125,7 +217,85 @@ function validateEnvelopeBase(input: JsonObject): { requestId?: string } {
   return { requestId };
 }
 
-function validateTask(value: unknown, requestId?: string): SpawnRequest["task"] {
+function validateTaskLimits(value: unknown, requestId?: string): TaskLimits {
+  const limits = assertObject(value, "task.limits", requestId);
+  return {
+    ...(limits.max_turns !== undefined
+      ? { max_turns: assertPositiveNumber(limits.max_turns, "task.limits.max_turns", requestId) }
+      : {}),
+    ...(limits.max_wall_time_sec !== undefined
+      ? { max_wall_time_sec: assertPositiveNumber(limits.max_wall_time_sec, "task.limits.max_wall_time_sec", requestId) }
+      : {}),
+    ...(limits.max_total_tokens !== undefined
+      ? { max_total_tokens: assertPositiveNumber(limits.max_total_tokens, "task.limits.max_total_tokens", requestId) }
+      : {}),
+    ...(limits.heartbeat_interval_sec !== undefined
+      ? { heartbeat_interval_sec: assertPositiveNumber(limits.heartbeat_interval_sec, "task.limits.heartbeat_interval_sec", requestId) }
+      : {}),
+    ...(limits.idle_timeout_sec !== undefined
+      ? { idle_timeout_sec: assertPositiveNumber(limits.idle_timeout_sec, "task.limits.idle_timeout_sec", requestId) }
+      : {}),
+    ...(limits.stall_timeout_sec !== undefined
+      ? { stall_timeout_sec: assertPositiveNumber(limits.stall_timeout_sec, "task.limits.stall_timeout_sec", requestId) }
+      : {})
+  };
+}
+
+function validateTaskExecution(value: unknown, requestId?: string): TaskExecution {
+  const execution = assertObject(value, "task.execution", requestId);
+  return {
+    ...(execution.model !== undefined
+      ? { model: assertString(execution.model, "task.execution.model", requestId) }
+      : {}),
+    ...(execution.temperature !== undefined
+      ? { temperature: assertNumber(execution.temperature, "task.execution.temperature", requestId) }
+      : {}),
+    ...(execution.max_output_tokens !== undefined
+      ? { max_output_tokens: assertPositiveNumber(execution.max_output_tokens, "task.execution.max_output_tokens", requestId) }
+      : {})
+  };
+}
+
+function validateTaskTools(value: unknown, requestId?: string): TaskTools {
+  const tools = assertObject(value, "task.tools", requestId);
+  return {
+    ...(tools.preset !== undefined
+      ? { preset: assertEnumValue(tools.preset, TOOL_PRESETS, "task.tools.preset", requestId) as ToolPreset }
+      : {}),
+    ...(tools.allow !== undefined
+      ? { allow: assertStringArray(tools.allow, "task.tools.allow", requestId) }
+      : {}),
+    ...(tools.deny !== undefined
+      ? { deny: assertStringArray(tools.deny, "task.tools.deny", requestId) }
+      : {})
+  };
+}
+
+function validateCompletionPolicy(value: unknown, requestId?: string): CompletionPolicy {
+  const completion = assertObject(value, "task.completion", requestId);
+  return {
+    ...(completion.require_structured_result !== undefined
+      ? {
+          require_structured_result: assertBoolean(
+            completion.require_structured_result,
+            "task.completion.require_structured_result",
+            requestId
+          )
+        }
+      : {}),
+    ...(completion.require_final_summary !== undefined
+      ? {
+          require_final_summary: assertBoolean(
+            completion.require_final_summary,
+            "task.completion.require_final_summary",
+            requestId
+          )
+        }
+      : {})
+  };
+}
+
+function validateTask(value: unknown, requestId?: string): TaskInput {
   const task = assertObject(value, "task", requestId);
   if (task.context !== undefined) {
     assertObject(task.context, "task.context", requestId);
@@ -133,18 +303,7 @@ function validateTask(value: unknown, requestId?: string): SpawnRequest["task"] 
   if (task.labels !== undefined) {
     assertRecordOfStrings(task.labels, "task.labels", requestId);
   }
-  if (task.inference !== undefined) {
-    assertObject(task.inference, "task.inference", requestId);
-  }
-  if (task.constraints !== undefined) {
-    assertObject(task.constraints, "task.constraints", requestId);
-  }
-  if (task.tool_policy !== undefined) {
-    assertObject(task.tool_policy, "task.tool_policy", requestId);
-  }
-  if (task.completion !== undefined) {
-    assertObject(task.completion, "task.completion", requestId);
-  }
+
   return {
     title: assertString(task.title, "task.title", requestId),
     goal: assertString(task.goal, "task.goal", requestId),
@@ -152,13 +311,17 @@ function validateTask(value: unknown, requestId?: string): SpawnRequest["task"] 
       ? { instructions: assertString(task.instructions, "task.instructions", requestId) }
       : {}),
     ...(task.cwd !== undefined ? { cwd: assertString(task.cwd, "task.cwd", requestId) } : {}),
-    ...(task.context !== undefined ? { context: task.context as SpawnRequest["task"]["context"] } : {}),
+    ...(task.context !== undefined ? { context: task.context as TaskInput["context"] } : {}),
     ...(task.labels !== undefined ? { labels: task.labels as Record<string, string> } : {}),
-    ...(task.artifacts !== undefined ? { artifacts: task.artifacts as SpawnRequest["task"]["artifacts"] } : {}),
-    ...(task.constraints !== undefined ? { constraints: task.constraints as SpawnRequest["task"]["constraints"] } : {}),
-    ...(task.inference !== undefined ? { inference: task.inference as SpawnRequest["task"]["inference"] } : {}),
-    ...(task.tool_policy !== undefined ? { tool_policy: task.tool_policy as SpawnRequest["task"]["tool_policy"] } : {}),
-    ...(task.completion !== undefined ? { completion: task.completion as SpawnRequest["task"]["completion"] } : {})
+    ...(task.artifacts !== undefined
+      ? { artifacts: assertAttachments(task.artifacts, "task.artifacts", requestId) }
+      : {}),
+    ...(task.limits !== undefined ? { limits: validateTaskLimits(task.limits, requestId) } : {}),
+    ...(task.execution !== undefined ? { execution: validateTaskExecution(task.execution, requestId) } : {}),
+    ...(task.tools !== undefined ? { tools: validateTaskTools(task.tools, requestId) } : {}),
+    ...(task.completion !== undefined
+      ? { completion: validateCompletionPolicy(task.completion, requestId) }
+      : {})
   };
 }
 
@@ -168,6 +331,7 @@ function validateSpawn(input: JsonObject): SpawnRequest {
     contract: CONTRACT_VERSION,
     ...(requestId ? { id: requestId } : {}),
     owner: assertOwner(input.owner, requestId),
+    idempotency_key: assertString(input.idempotency_key, "idempotency_key", requestId),
     task: validateTask(input.task, requestId)
   };
 }
@@ -180,7 +344,7 @@ function validateRecv(input: JsonObject): RecvRequest {
     owner: assertOwner(input.owner, requestId),
     tasks: assertRecordOfStrings(input.tasks, "tasks", requestId),
     ...(input.max_events !== undefined
-      ? { max_events: assertNumber(input.max_events, "max_events", requestId) }
+      ? { max_events: assertPositiveNumber(input.max_events, "max_events", requestId) }
       : {})
   };
 }
@@ -192,8 +356,8 @@ function validateAwait(input: JsonObject): AwaitRequest {
     ...(requestId ? { id: requestId } : {}),
     owner: assertOwner(input.owner, requestId),
     task_id: assertString(input.task_id, "task_id", requestId),
-    until: assertStringArray(input.until, "until", requestId) as AwaitRequest["until"],
-    timeout_ms: assertNumber(input.timeout_ms, "timeout_ms", requestId),
+    until: assertEnumArray(input.until, AWAIT_CONDITIONS, "until", requestId),
+    timeout_ms: assertPositiveNumber(input.timeout_ms, "timeout_ms", requestId),
     ...(input.cursor !== undefined ? { cursor: assertString(input.cursor, "cursor", requestId) } : {})
   };
 }
@@ -207,7 +371,16 @@ function validateSend(input: JsonObject): SendRequest {
     owner: assertOwner(input.owner, requestId),
     task_id: assertString(input.task_id, "task_id", requestId),
     message: {
-      ...(message.kind !== undefined ? { kind: assertString(message.kind, "message.kind", requestId) as SendRequest["message"]["kind"] } : {}),
+      ...(message.kind !== undefined
+        ? {
+            kind: assertEnumValue(
+              message.kind,
+              DIRECTIVE_KINDS,
+              "message.kind",
+              requestId
+            ) as DirectiveKind
+          }
+        : {}),
       content: assertString(message.content, "message.content", requestId)
     }
   };
@@ -225,14 +398,24 @@ function validateInspect(input: JsonObject): InspectRequest {
 
 function validateList(input: JsonObject): ListRequest {
   const { requestId } = validateEnvelopeBase(input);
-  if (input.filter !== undefined) {
-    assertObject(input.filter, "filter", requestId);
-  }
+  const filter = input.filter === undefined ? undefined : assertObject(input.filter, "filter", requestId);
+
   return {
     contract: CONTRACT_VERSION,
     ...(requestId ? { id: requestId } : {}),
     owner: assertOwner(input.owner, requestId),
-    ...(input.filter !== undefined ? { filter: input.filter as ListRequest["filter"] } : {})
+    ...(filter
+      ? {
+          filter: {
+            ...(filter.states !== undefined
+              ? { states: assertEnumArray(filter.states, TASK_STATES, "filter.states", requestId) as TaskState[] }
+              : {}),
+            ...(filter.labels !== undefined
+              ? { labels: assertRecordOfStrings(filter.labels, "filter.labels", requestId) }
+              : {})
+          }
+        }
+      : {})
   };
 }
 
@@ -249,15 +432,23 @@ function validateCancel(input: JsonObject): CancelRequest {
 
 function validateRun(input: JsonObject): RunRequest {
   const { requestId } = validateEnvelopeBase(input);
-  if (input.await !== undefined) {
-    assertObject(input.await, "await", requestId);
-  }
+  const awaitConfig = input.await === undefined ? undefined : assertObject(input.await, "await", requestId);
+
   return {
     contract: CONTRACT_VERSION,
     ...(requestId ? { id: requestId } : {}),
     owner: assertOwner(input.owner, requestId),
+    idempotency_key: assertString(input.idempotency_key, "idempotency_key", requestId),
     task: validateTask(input.task, requestId),
-    ...(input.await !== undefined ? { await: input.await as RunRequest["await"] } : {})
+    ...(awaitConfig
+      ? {
+          await: {
+            ...(awaitConfig.timeout_ms !== undefined
+              ? { timeout_ms: assertPositiveNumber(awaitConfig.timeout_ms, "await.timeout_ms", requestId) }
+              : {})
+          }
+        }
+      : {})
   };
 }
 
@@ -295,7 +486,7 @@ export const COMMANDS: Record<CommandName, CommandSpec> = {
   contract: {
     name: "contract",
     requiresInput: false,
-    handle: async () => ok(CONTRACT_SUMMARY as unknown as JsonValue)
+    handle: async () => ok(CONTRACT_SUMMARY)
   },
   spawn: {
     name: "spawn",
@@ -362,4 +553,3 @@ export const COMMANDS: Record<CommandName, CommandSpec> = {
     }
   }
 };
-
